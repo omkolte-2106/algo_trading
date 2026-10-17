@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     STALE_DATA_SECONDS: int = 120
     DEMO_MODE: bool = False
     DB_PATH: str = "trader.db"
+    DB_HOST: str = "localhost"
+    DB_PORT: int = 5432
+    DB_NAME: str = "algo_bot"
+    DB_USER: str = "postgres"
+    DB_PASSWORD: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
