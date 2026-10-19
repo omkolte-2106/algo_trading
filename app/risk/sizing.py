@@ -16,6 +16,9 @@ def calculate_position_size(
     max_notional: float = 50000.0,
 ) -> float:
     """Calculate allowable order size according to risk rules."""
+    if equity <= 0 or entry_price <= 0:
+        return 0.0
+
     stop_distance = abs(entry_price - stop_loss)
     if stop_distance <= 0:
         return 0.0

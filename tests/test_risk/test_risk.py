@@ -445,3 +445,26 @@ class TestFullPipeline:
         # Stale data reason should appear (it's checked first)
         assert not decision.approved
         assert "stale" in decision.reason.lower()
+
+    def test_halt_reason_property(self):
+        rm = make_manager()
+        assert rm.halt_reason == ""
+        rm.halt("Emergency stop")
+        assert rm.halt_reason == "Emergency stop"
+        rm.resume()
+        assert rm.halt_reason == ""
+
+    def test_uninitialized_last_data_ts_is_rejected(self):
+        rm = make_manager()
+        account = make_account()
+        account.last_data_ts = 0  # Uninitialized
+        decision = rm.evaluate(make_signal(), account)
+        assert not decision.approved
+        assert "stale" in decision.reason.lower()
+
+    def test_non_positive_equity_rejects_signal(self):
+        rm = make_manager()
+        account = make_account(equity=0.0, peak_equity=0.0)
+        decision = rm.evaluate(make_signal(), account)
+        assert not decision.approved
+        assert "zero or negative" in decision.reason.lower()

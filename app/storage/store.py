@@ -97,6 +97,15 @@ class PostgresStore(Store):
                         ts BIGINT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_risk_events_ts ON risk_events(ts DESC);
+
+                    CREATE TABLE IF NOT EXISTS logs (
+                        id SERIAL PRIMARY KEY,
+                        level VARCHAR(16) NOT NULL,
+                        message TEXT NOT NULL,
+                        module VARCHAR(64),
+                        ts BIGINT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);
                 """)
             conn.commit()
         logger.info(f"[storage] Connected to PostgreSQL database '{self.conn_params['dbname']}' and initialized tables.")
@@ -171,6 +180,19 @@ class PostgresStore(Store):
                 )
             conn.commit()
 
+    def save_log(self, level: str, message: str, module: str = "", ts: Optional[int] = None) -> None:
+        now = ts if ts is not None else int(time.time())
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO logs (level, message, module, ts)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (level.upper(), message, module, now),
+                )
+            conn.commit()
+
     def get_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -207,88 +229,144 @@ class PostgresStore(Store):
                 )
                 return [dict(row) for row in cur.fetchall()]
 
+    def get_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM logs ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_latest_equity(self) -> Optional[float]:
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 1")
+                row = cur.fetchone()
+                return float(row["equity"]) if row else None
+
+    def clear_all(self) -> None:
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE signals, trades, equity_snapshots, risk_events, logs RESTART IDENTITY")
+            conn.commit()
+
 
 class SQLiteStore(Store):
-    """SQLite implementation fallback for local development or testing without Postgres."""
+    """Production-grade SQLite persistence store implementing Store protocol (Role C)."""
 
     def __init__(self, db_path: str = settings.DB_PATH):
         self.db_path = db_path
         self._init_db()
 
+    def _get_connection(self) -> sqlite3.Connection:
+        """Create a connection with WAL mode, busy timeout, and row factory."""
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        """Initialize SQLite tables and performance indexes."""
+        with self._get_connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    side TEXT,
-                    entry_price REAL,
-                    stop_loss REAL,
-                    take_profit REAL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
                     reason TEXT,
-                    approved INTEGER,
-                    approved_size REAL,
-                    ts INTEGER
-                )
+                    approved INTEGER NOT NULL,
+                    approved_size REAL NOT NULL,
+                    ts INTEGER NOT NULL
+                );
             """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts DESC);")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    side TEXT,
-                    size REAL,
-                    entry_price REAL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    size REAL NOT NULL,
+                    entry_price REAL NOT NULL,
                     client_order_id TEXT,
                     order_id TEXT,
                     status TEXT,
                     error TEXT,
-                    ts INTEGER
-                )
+                    ts INTEGER NOT NULL
+                );
             """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts DESC);")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS equity_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts INTEGER,
-                    equity REAL
-                )
+                    ts INTEGER NOT NULL,
+                    equity REAL NOT NULL
+                );
             """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(ts ASC);")
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS risk_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT,
-                    reason TEXT,
-                    ts INTEGER
-                )
+                    event_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    ts INTEGER NOT NULL
+                );
             """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_risk_events_ts ON risk_events(ts DESC);")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    level TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    module TEXT,
+                    ts INTEGER NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);")
+            conn.commit()
 
     def save_signal(self, signal: Signal, decision: RiskDecision) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             conn.execute(
-                "INSERT INTO signals (symbol, side, entry_price, stop_loss, take_profit, reason, approved, approved_size, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO signals (symbol, side, entry_price, stop_loss, take_profit, reason, approved, approved_size, ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     signal.symbol,
                     signal.side,
-                    signal.entry_price,
-                    signal.stop_loss,
-                    signal.take_profit,
+                    float(signal.entry_price),
+                    float(signal.stop_loss),
+                    float(signal.take_profit),
                     signal.reason,
                     1 if decision.approved else 0,
-                    decision.size,
-                    signal.ts,
+                    float(decision.size),
+                    int(signal.ts),
                 ),
             )
+            conn.commit()
 
     def save_trade(self, order: OrderRequest, result: OrderResult) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             conn.execute(
-                "INSERT INTO trades (symbol, side, size, entry_price, client_order_id, order_id, status, error, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO trades (symbol, side, size, entry_price, client_order_id, order_id, status, error, ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     order.symbol,
                     order.side,
-                    order.size,
-                    order.entry_price,
+                    float(order.size),
+                    float(order.entry_price),
                     order.client_order_id,
                     result.order_id,
                     result.status,
@@ -296,49 +374,101 @@ class SQLiteStore(Store):
                     int(time.time()),
                 ),
             )
+            conn.commit()
 
     def save_equity(self, ts: int, equity: float) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             conn.execute(
                 "INSERT INTO equity_snapshots (ts, equity) VALUES (?, ?)",
-                (ts, equity),
+                (int(ts), float(equity)),
             )
+            conn.commit()
 
     def save_risk_event(self, event_type: str, reason: str, ts: Optional[int] = None) -> None:
         now = ts if ts is not None else int(time.time())
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             conn.execute(
                 "INSERT INTO risk_events (event_type, reason, ts) VALUES (?, ?, ?)",
                 (event_type, reason, now),
             )
+            conn.commit()
+
+    def save_log(self, level: str, message: str, module: str = "", ts: Optional[int] = None) -> None:
+        now = ts if ts is not None else int(time.time())
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO logs (level, message, module, ts) VALUES (?, ?, ?, ?)",
+                (level.upper(), message, module, now),
+            )
+            conn.commit()
 
     def get_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_equity_curve(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM equity_snapshots ORDER BY ts ASC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_signals(self, limit: int = 100) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_risk_events(self, limit: int = 100) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM risk_events ORDER BY id DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_latest_equity(self) -> Optional[float]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT equity FROM equity_snapshots ORDER BY ts DESC LIMIT 1")
+            row = cursor.fetchone()
+            return float(row["equity"]) if row else None
+
+    def clear_all(self) -> None:
+        """Clear all tables (useful for unit tests and clean slate)."""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM signals;")
+            conn.execute("DELETE FROM trades;")
+            conn.execute("DELETE FROM equity_snapshots;")
+            conn.execute("DELETE FROM risk_events;")
+            conn.execute("DELETE FROM logs;")
+            conn.commit()
+
+
+class StoreLoggingHandler(logging.Handler):
+    """Logging handler that persists log records to the Store."""
+
+    def __init__(self, store: Store, level=logging.INFO):
+        super().__init__(level)
+        self.store = store
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if hasattr(self.store, "save_log"):
+                msg = self.format(record)
+                self.store.save_log(
+                    level=record.levelname,
+                    message=msg,
+                    module=record.name,
+                    ts=int(record.created),
+                )
+        except Exception:
+            self.handleError(record)
 
 
 def get_default_store() -> Store:

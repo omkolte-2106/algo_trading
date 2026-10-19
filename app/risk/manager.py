@@ -44,6 +44,11 @@ class DeltaRiskManager(RiskManager):
         self._flatten_callback = flatten_callback
         self._clock = clock or time.time
 
+    @property
+    def halt_reason(self) -> str:
+        """Return the reason why the system is halted, or empty string if not halted."""
+        return self._halt_reason
+
     # ------------------------------------------------------------------
     # RiskManager Protocol implementation
     # ------------------------------------------------------------------
@@ -67,7 +72,7 @@ class DeltaRiskManager(RiskManager):
         # -----------------------------------------------------------
         now = self._clock()
         data_age = now - account.last_data_ts
-        if data_age > settings.STALE_DATA_SECONDS:
+        if account.last_data_ts <= 0 or data_age > settings.STALE_DATA_SECONDS:
             reason = (
                 f"Stale market data: last tick was {data_age:.0f}s ago "
                 f"(limit {settings.STALE_DATA_SECONDS}s)"

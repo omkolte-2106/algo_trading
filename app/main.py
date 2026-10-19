@@ -1,12 +1,12 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.fakes import FakeExecutor, FakeMarketData
-from app.storage.store import get_default_store
+from app.storage.store import get_default_store, StoreLoggingHandler
 from app.risk.manager import DeltaRiskManager
-from app.api.routes import router as api_router, set_services
+from app.api.routes import router as api_router, set_services, ws_manager
 
 # Setup logging per working rules: [module] message
 logging.basicConfig(
@@ -15,11 +15,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("app.main")
 
-# Global services
+# Global services (Role C defaults to fakes & SQLiteStore, injectable at runtime)
 store = get_default_store()
 executor = FakeExecutor()
 risk_manager = DeltaRiskManager(flatten_callback=executor.flatten_all)
 market_data = FakeMarketData()
+
+# Attach SQLite/Postgres Store logging handler
+store_logging_handler = StoreLoggingHandler(store=store, level=logging.INFO)
+logging.getLogger().addHandler(store_logging_handler)
 
 # Connect runtime services to API router
 set_services(
@@ -32,19 +36,20 @@ set_services(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up Algo Trading Bot...")
-    logger.info(f"Target Symbol: {settings.SYMBOL}, Timeframe: {settings.TIMEFRAME}")
-    logger.info(f"Testnet URL: {settings.DELTA_BASE_URL}")
-    logger.info(f"Database: PostgreSQL '{settings.DB_NAME}' on {settings.DB_HOST}:{settings.DB_PORT}")
+    logger.info("Target Symbol: %s, Timeframe: %s", settings.SYMBOL, settings.TIMEFRAME)
+    logger.info("Testnet URL: %s", settings.DELTA_BASE_URL)
+    logger.info("Active Storage: %s", store.__class__.__name__)
     yield
     logger.info("Shutting down Algo Trading Bot...")
 
 app = FastAPI(
     title="Delta Exchange Algo Trading Bot",
-    description="Automated algorithmic trading system on Delta Exchange Testnet",
-    version="0.1.0",
+    description="Automated algorithmic trading system on Delta Exchange Testnet (Role C API & Risk Engine)",
+    version="1.0.0",
     lifespan=lifespan
 )
 
+# Enable CORS for dashboard UI (React / Next.js / Tailwind on any local port)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,7 +62,7 @@ app.add_middleware(
 def root():
     return {
         "name": "Delta Exchange Algo Trader",
-        "status": "running",
+        "status": "halted" if risk_manager.is_halted() else "running",
         "symbol": settings.SYMBOL,
         "demo_mode": settings.DEMO_MODE,
         "database": getattr(store, "__class__", type(store)).__name__
@@ -67,15 +72,6 @@ def root():
 def health():
     return {"status": "ok"}
 
-@app.get("/status")
-def get_status():
-    account = executor.get_account_state()
-    return {
-        "status": "halted" if risk_manager.is_halted() else "online",
-        "equity": account.equity,
-        "daily_pnl": account.daily_pnl,
-        "is_halted": risk_manager.is_halted(),
-        "open_positions": [p.model_dump() for p in account.open_positions]
-    }
-
+# Mount API router under both /api and root prefixes for seamless dashboard compatibility
+app.include_router(api_router, prefix="/api")
 app.include_router(api_router)
