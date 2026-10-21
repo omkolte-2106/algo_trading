@@ -106,6 +106,22 @@ class PostgresStore(Store):
                         ts BIGINT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);
+
+                    CREATE TABLE IF NOT EXISTS candles (
+                        id SERIAL PRIMARY KEY,
+                        symbol VARCHAR(32) NOT NULL,
+                        timeframe VARCHAR(16) NOT NULL,
+                        ts BIGINT NOT NULL,
+                        open DOUBLE PRECISION NOT NULL,
+                        high DOUBLE PRECISION NOT NULL,
+                        low DOUBLE PRECISION NOT NULL,
+                        close DOUBLE PRECISION NOT NULL,
+                        volume DOUBLE PRECISION NOT NULL,
+                        CONSTRAINT uq_candle UNIQUE (symbol, timeframe, ts)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles(symbol, timeframe, ts ASC);
+
+                    ALTER TABLE trades ADD COLUMN IF NOT EXISTS reason TEXT;
                 """)
             conn.commit()
         logger.info(f"[storage] Connected to PostgreSQL database '{self.conn_params['dbname']}' and initialized tables.")
@@ -132,13 +148,14 @@ class PostgresStore(Store):
                 )
             conn.commit()
 
-    def save_trade(self, order: OrderRequest, result: OrderResult) -> None:
+    def save_trade(self, order: OrderRequest, result: OrderResult, reason: Optional[str] = None) -> None:
+        trade_reason = reason or getattr(order, "reason", None) or ""
         with self._get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO trades (symbol, side, size, entry_price, client_order_id, order_id, status, error, ts)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO trades (symbol, side, size, entry_price, client_order_id, order_id, status, error, reason, ts)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         order.symbol,
@@ -149,6 +166,7 @@ class PostgresStore(Store):
                         result.order_id,
                         result.status,
                         result.error,
+                        trade_reason,
                         int(time.time()),
                     ),
                 )
@@ -245,10 +263,113 @@ class PostgresStore(Store):
                 row = cur.fetchone()
                 return float(row["equity"]) if row else None
 
+    def save_candles(self, symbol: str, timeframe: str, candles: List[Any]) -> int:
+        if not candles:
+            return 0
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                from psycopg2.extras import execute_values
+                records_dict = {}
+                for c in candles:
+                    c_ts = int(c.ts if hasattr(c, "ts") else c["ts"])
+                    records_dict[(symbol, timeframe, c_ts)] = (
+                        symbol,
+                        timeframe,
+                        c_ts,
+                        float(c.open if hasattr(c, "open") else c["open"]),
+                        float(c.high if hasattr(c, "high") else c["high"]),
+                        float(c.low if hasattr(c, "low") else c["low"]),
+                        float(c.close if hasattr(c, "close") else c["close"]),
+                        float(c.volume if hasattr(c, "volume") else c["volume"]),
+                    )
+                records = list(records_dict.values())
+                if records:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO candles (symbol, timeframe, ts, open, high, low, close, volume)
+                        VALUES %s
+                        ON CONFLICT (symbol, timeframe, ts) DO UPDATE SET
+                            open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            volume = EXCLUDED.volume
+                        """,
+                        records,
+                        page_size=2000,
+                    )
+            conn.commit()
+        return len(records)
+
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 100,
+        before_ts: Optional[int] = None,
+        after_ts: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                query = "SELECT ts, open, high, low, close, volume FROM candles WHERE symbol = %s AND timeframe = %s"
+                params: List[Any] = [symbol, timeframe]
+                if before_ts is not None:
+                    query += " AND ts < %s"
+                    params.append(before_ts)
+                if after_ts is not None:
+                    query += " AND ts > %s"
+                    params.append(after_ts)
+                query += " ORDER BY ts DESC LIMIT %s"
+                params.append(limit)
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                rows.reverse()
+                return [dict(r) for r in rows]
+
+    def get_candle_count(self, symbol: str, timeframe: str) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT COUNT(*) as count, MIN(ts) as min_ts, MAX(ts) as max_ts FROM candles WHERE symbol = %s AND timeframe = %s",
+                    (symbol, timeframe),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else {"count": 0, "min_ts": None, "max_ts": None}
+
+    def get_stored_timeframes(self, symbol: str) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT timeframe, COUNT(*) as count, MIN(ts) as min_ts, MAX(ts) as max_ts FROM candles WHERE symbol = %s GROUP BY timeframe ORDER BY timeframe",
+                    (symbol,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_latest_candle(self, symbol: str, timeframe: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if timeframe:
+                    cur.execute(
+                        "SELECT ts, open, high, low, close, volume FROM candles WHERE symbol = %s AND timeframe = %s ORDER BY ts DESC LIMIT 1",
+                        (symbol, timeframe),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT ts, open, high, low, close, volume FROM candles WHERE symbol = %s ORDER BY ts DESC LIMIT 1",
+                        (symbol,),
+                    )
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def get_latest_price(self, symbol: str, timeframe: Optional[str] = None) -> Optional[float]:
+        c = self.get_latest_candle(symbol, timeframe)
+        return float(c["close"]) if c and "close" in c else None
+
     def clear_all(self) -> None:
         with self._get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("TRUNCATE TABLE signals, trades, equity_snapshots, risk_events, logs RESTART IDENTITY")
+                cur.execute("TRUNCATE TABLE signals, trades, equity_snapshots, risk_events, logs, candles RESTART IDENTITY")
             conn.commit()
 
 
@@ -332,6 +453,27 @@ class SQLiteStore(Store):
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);")
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS candles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume REAL NOT NULL,
+                    UNIQUE(symbol, timeframe, ts)
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_candles_sqlite ON candles(symbol, timeframe, ts ASC);")
+
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN reason TEXT;")
+            except Exception:
+                pass
             conn.commit()
 
     def save_signal(self, signal: Signal, decision: RiskDecision) -> None:
@@ -355,12 +497,13 @@ class SQLiteStore(Store):
             )
             conn.commit()
 
-    def save_trade(self, order: OrderRequest, result: OrderResult) -> None:
+    def save_trade(self, order: OrderRequest, result: OrderResult, reason: Optional[str] = None) -> None:
+        trade_reason = reason or getattr(order, "reason", None) or ""
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO trades (symbol, side, size, entry_price, client_order_id, order_id, status, error, ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (symbol, side, size, entry_price, client_order_id, order_id, status, error, reason, ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order.symbol,
@@ -371,6 +514,7 @@ class SQLiteStore(Store):
                     result.order_id,
                     result.status,
                     result.error,
+                    trade_reason,
                     int(time.time()),
                 ),
             )
@@ -439,6 +583,105 @@ class SQLiteStore(Store):
             row = cursor.fetchone()
             return float(row["equity"]) if row else None
 
+    def save_candles(self, symbol: str, timeframe: str, candles: List[Any]) -> int:
+        if not candles:
+            return 0
+        with self._get_connection() as conn:
+            records_dict = {}
+            for c in candles:
+                c_ts = int(c.ts if hasattr(c, "ts") else c["ts"])
+                records_dict[(symbol, timeframe, c_ts)] = (
+                    symbol,
+                    timeframe,
+                    c_ts,
+                    float(c.open if hasattr(c, "open") else c["open"]),
+                    float(c.high if hasattr(c, "high") else c["high"]),
+                    float(c.low if hasattr(c, "low") else c["low"]),
+                    float(c.close if hasattr(c, "close") else c["close"]),
+                    float(c.volume if hasattr(c, "volume") else c["volume"]),
+                )
+            records = list(records_dict.values())
+            if records:
+                conn.executemany(
+                    """
+                    INSERT INTO candles (symbol, timeframe, ts, open, high, low, close, volume)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, timeframe, ts) DO UPDATE SET
+                        open = excluded.open,
+                        high = excluded.high,
+                        low = excluded.low,
+                        close = excluded.close,
+                        volume = excluded.volume
+                    """,
+                    records,
+                )
+            conn.commit()
+        return len(records)
+
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 100,
+        before_ts: Optional[int] = None,
+        after_ts: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            query = "SELECT ts, open, high, low, close, volume FROM candles WHERE symbol = ? AND timeframe = ?"
+            params: List[Any] = [symbol, timeframe]
+            if before_ts is not None:
+                query += " AND ts < ?"
+                params.append(before_ts)
+            if after_ts is not None:
+                query += " AND ts > ?"
+                params.append(after_ts)
+            query += " ORDER BY ts DESC LIMIT ?"
+            params.append(limit)
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            rows.reverse()
+            return [dict(r) for r in rows]
+
+    def get_candle_count(self, symbol: str, timeframe: str) -> Dict[str, Any]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) as count, MIN(ts) as min_ts, MAX(ts) as max_ts FROM candles WHERE symbol = ? AND timeframe = ?",
+                (symbol, timeframe),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else {"count": 0, "min_ts": None, "max_ts": None}
+
+    def get_stored_timeframes(self, symbol: str) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT timeframe, COUNT(*) as count, MIN(ts) as min_ts, MAX(ts) as max_ts FROM candles WHERE symbol = ? GROUP BY timeframe ORDER BY timeframe",
+                (symbol,),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_latest_candle(self, symbol: str, timeframe: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if timeframe:
+                cursor.execute(
+                    "SELECT ts, open, high, low, close, volume FROM candles WHERE symbol = ? AND timeframe = ? ORDER BY ts DESC LIMIT 1",
+                    (symbol, timeframe),
+                )
+            else:
+                cursor.execute(
+                    "SELECT ts, open, high, low, close, volume FROM candles WHERE symbol = ? ORDER BY ts DESC LIMIT 1",
+                    (symbol,),
+                )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_latest_price(self, symbol: str, timeframe: Optional[str] = None) -> Optional[float]:
+        c = self.get_latest_candle(symbol, timeframe)
+        return float(c["close"]) if c and "close" in c else None
+
     def clear_all(self) -> None:
         """Clear all tables (useful for unit tests and clean slate)."""
         with self._get_connection() as conn:
@@ -447,6 +690,7 @@ class SQLiteStore(Store):
             conn.execute("DELETE FROM equity_snapshots;")
             conn.execute("DELETE FROM risk_events;")
             conn.execute("DELETE FROM logs;")
+            conn.execute("DELETE FROM candles;")
             conn.commit()
 
 

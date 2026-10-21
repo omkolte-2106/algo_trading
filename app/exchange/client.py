@@ -365,10 +365,41 @@ class DeltaClient:
 
 
 class DeltaMarketData(MarketData):
-    """Adapter wrapping DeltaClient to satisfy the MarketData protocol."""
+    """Production MarketData adapter that fetches live candles from Delta Exchange
+    and automatically persists/caches them into PostgreSQL / SQLite storage.
+    """
 
-    def __init__(self, client: Optional[DeltaClient] = None):
+    def __init__(self, client: Optional[DeltaClient] = None, store: Optional[Any] = None):
         self.client = client or DeltaClient()
+        self.store = store
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        s = (symbol or settings.SYMBOL).upper().replace("/", "").replace("-", "")
+        if s.endswith("PERP"):
+            s = s[:-4]
+        return s
 
     def get_candles(self, symbol: str, resolution: str, limit: int = 100) -> List[Candle]:
-        return self.client.get_candles(symbol=symbol, resolution=resolution, limit=limit)
+        norm_sym = self._normalize_symbol(symbol)
+        candles: List[Candle] = []
+
+        # 1. Fetch live candles from Delta Exchange Testnet REST API
+        try:
+            candles = self.client.get_candles(symbol=norm_sym, resolution=resolution, limit=limit)
+            if candles and self.store and hasattr(self.store, "save_candles"):
+                try:
+                    self.store.save_candles(norm_sym, resolution, candles)
+                    logger.debug("[exchange] Successfully persisted %d live Delta candles for %s (%s)", len(candles), norm_sym, resolution)
+                except Exception as save_err:
+                    logger.debug("[exchange] Could not persist live candles to store: %s", save_err)
+        except Exception as exc:
+            logger.warning("[exchange] Could not fetch live candles from Delta Exchange: %s", exc)
+
+        # 2. If Delta Exchange is temporarily unreachable, fall back to database store
+        if not candles and self.store and hasattr(self.store, "get_candles"):
+            stored = self.store.get_candles(norm_sym, resolution, limit=limit)
+            if stored and len(stored) > 0:
+                candles = [Candle(**item) for item in stored]
+                logger.info("[exchange] Using %d cached candles from store for %s (%s)", len(candles), norm_sym, resolution)
+
+        return candles

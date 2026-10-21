@@ -54,8 +54,9 @@ class FakeExecutor:
 
 
 class FakeMarketData:
-    """Fake market data reading sample candles from fixture files."""
-    def __init__(self, fixtures_dir: Optional[str] = None):
+    """Market data provider reading candles from database store or fixture files."""
+    def __init__(self, fixtures_dir: Optional[str] = None, store: Optional[Store] = None):
+        self.store = store
         if fixtures_dir is None:
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
             fixtures_dir = os.path.join(base_dir, "tests", "fixtures")
@@ -72,6 +73,10 @@ class FakeMarketData:
         return [Candle(**item) for item in data]
 
     def get_candles(self, symbol: str, resolution: str, limit: int = 100) -> List[Candle]:
+        if self.store and hasattr(self.store, "get_candles"):
+            stored = self.store.get_candles(symbol, resolution, limit=limit)
+            if stored and len(stored) > 0:
+                return [Candle(**item) for item in stored]
         candles = self._1h_candles if resolution in ("1h", "60", "60m") else self._15m_candles
         return candles[-limit:] if limit > 0 else candles
 
@@ -90,10 +95,11 @@ class FakeStore:
             "recorded_at": int(time.time())
         })
 
-    def save_trade(self, order: OrderRequest, result: OrderResult) -> None:
+    def save_trade(self, order: OrderRequest, result: OrderResult, reason: str = "") -> None:
         self.trades.append({
             "order": order.model_dump(),
             "result": result.model_dump(),
+            "reason": reason,
             "recorded_at": int(time.time())
         })
 

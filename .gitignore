@@ -35,10 +35,8 @@ dist/
 out/
 build/
 
-# IDE & OS files
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
+# Large data files & caches
+*.parquet
+backtest/cache/
+ALGO COMPETITION/
+

@@ -1,20 +1,199 @@
-"""Trend-following strategy with volatility filter on BTCUSD 15m candles (Role B).
+"""Trend-following strategy implementing the `Strategy` contract (Role B).
 
-Entry rules:
-- Long: EMA(20) crosses above EMA(50), ADX(14) > 20, and 1h close > 1h EMA(50).
-- Short: EMA(20) crosses below EMA(50), ADX(14) > 20, and 1h close < 1h EMA(50).
-- Stop loss: 1.5 x ATR(14) from entry.
-- Take profit: 2R.
+Features:
+- Dual-timeframe: 15m entry candles aligned with 1h higher-timeframe trend filter.
+- Regime-switching: ADX trend vs ranging detection with EMA-cross trending legs and
+  mean-reversion RSI/Bollinger legs.
+- Vectorized `compute_signals` for high-throughput backtesting.
+- Real-time `generate_signal` for the live trading engine loop.
+- Pure functions: no network, no hidden state.
 """
+from dataclasses import dataclass
 from typing import Optional, List
-from app.models import Candle, Signal
-from app.interfaces import Strategy
 
-class TrendFollowingStrategy(Strategy):
-    """Trend-following strategy implementation satisfying Strategy Protocol."""
-    def __init__(self, symbol: str = "BTCUSD"):
+import numpy as np
+import pandas as pd
+
+from app.data.indicators import ema, atr, adx, rsi as _rsi, bollinger as _bb
+from app.models import Candle, Signal
+from app.strategy.base import BaseStrategy
+
+
+@dataclass(frozen=True)
+class TrendParams:
+    entry_mode: str = "ema_cross"   # "ema_cross" | "breakout" | "pullback" | "regime"
+    ema_fast: int = 20
+    ema_slow: int = 50
+    adx_period: int = 14
+    adx_min: float = 20.0
+    atr_period: int = 14
+    atr_stop_mult: float = 1.5
+    rr: float = 2.0                  # take-profit = rr * risk
+    htf_ema: int = 50
+    breakout_lookback: int = 20      # Donchian channel length (breakout mode)
+    use_htf_filter: bool = True
+
+    # --- regime switch (entry_mode="regime") ---
+    adx_trend: float = 25.0          # ADX >= this -> trending -> trend-follow
+    adx_range: float = 20.0          # ADX <  this -> ranging  -> mean-revert
+    rsi_period: int = 14
+    rsi_os: float = 30.0             # oversold -> fade long
+    rsi_ob: float = 70.0             # overbought -> fade short
+    bb_period: int = 20
+    bb_mult: float = 2.0
+    # per-regime exit plans (ATR multiples; tp_rr NaN = trail out)
+    trend_stop_mult: float = 2.0
+    trend_trail_mult: float = 4.0
+    trend_tp_ceiling_r: float = 6.0  # live bracket TP for trailing legs (executor trails the stop)
+    mr_stop_mult: float = 1.5
+    mr_tp_rr: float = 1.0            # mean-reversion target in R (bounce to mean)
+
+
+OHLCV = ["open", "high", "low", "close", "volume"]
+
+
+def _candles_to_df(candles: List[Candle]) -> pd.DataFrame:
+    df = pd.DataFrame([c.model_dump() for c in candles])
+    df.index = pd.to_datetime(df["ts"], unit="s", utc=True)
+    return df[OHLCV]
+
+
+def _align_htf(df15: pd.DataFrame, df1h: pd.DataFrame, htf_ema: int) -> pd.DataFrame:
+    """Attach the last CLOSED 1h EMA/close to each 15m bar (no lookahead).
+
+    A 1h candle open at T closes at T+1h, so a 15m bar at time t may only use
+    1h candles with close-time <= t.
+    """
+    htf = pd.DataFrame(index=df1h.index)
+    htf["htf_close"] = df1h["close"]
+    htf["htf_ema"] = ema(df1h["close"], htf_ema)
+    htf["avail"] = (htf.index + pd.Timedelta(hours=1)).as_unit("ns")  # close time
+    htf = htf.sort_values("avail")
+    left = df15.sort_index().copy()
+    left["_ts"] = left.index.as_unit("ns")
+    merged = pd.merge_asof(
+        left,
+        htf[["avail", "htf_close", "htf_ema"]],
+        left_on="_ts",
+        right_on="avail",
+        direction="backward",
+    )
+    merged.index = left.index
+    return merged
+
+
+def compute_signals(df15: pd.DataFrame, df1h: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.DataFrame:
+    """Return df15 annotated with indicators and per-bar signal columns.
+
+    Added columns: ema_fast, ema_slow, adx, atr, htf_close, htf_ema,
+    side ('buy'/'sell'/''), entry, stop, tp, reason.
+    `side` is the signal for a bar that has CLOSED at that timestamp; the engine
+    acts on the next bar.
+    """
+    df = df15.copy()
+    df["ema_fast"] = ema(df["close"], p.ema_fast)
+    df["ema_slow"] = ema(df["close"], p.ema_slow)
+    df["adx"] = adx(df["high"], df["low"], df["close"], p.adx_period)
+    df["atr"] = atr(df["high"], df["low"], df["close"], p.atr_period)
+    df["rsi"] = _rsi(df["close"], p.rsi_period)
+    df["bb_mid"], df["bb_up"], df["bb_lo"] = _bb(df["close"], p.bb_period, p.bb_mult)
+
+    htf = _align_htf(df, df1h, p.htf_ema)
+    df["htf_close"] = htf["htf_close"].values
+    df["htf_ema"] = htf["htf_ema"].values
+
+    fast, slow = df["ema_fast"], df["ema_slow"]
+    df["side"] = ""
+    # per-signal exit plan: NaN -> engine uses its own cfg default
+    df["stop_mult"] = np.nan
+    df["tp_rr"] = np.nan
+    df["trail_mult"] = np.nan
+    df["reason"] = ""
+
+    def _apply(mask_long, mask_short, stop_mult, tp_rr, trail_mult, tag):
+        for mask, sd in ((mask_long, "buy"), (mask_short, "sell")):
+            m = mask & (df["side"] == "")   # don't overwrite an existing signal
+            df.loc[m, "side"] = sd
+            df.loc[m, "stop_mult"] = stop_mult
+            df.loc[m, "tp_rr"] = tp_rr
+            df.loc[m, "trail_mult"] = trail_mult
+            df.loc[m, "reason"] = tag + (" long" if sd == "buy" else " short") \
+                + " ADX" + df.loc[m, "adx"].round(0).astype(int).astype(str) \
+                + " RSI" + df.loc[m, "rsi"].round(0).astype(int).astype(str)
+
+    if p.entry_mode == "regime":
+        trending = df["adx"] >= p.adx_trend
+        ranging = df["adx"] < p.adx_range
+        # trend-follow leg (EMA cross confirmed by trend, ATR trail out)
+        t_long = trending & (fast > slow) & (fast.shift(1) <= slow.shift(1))
+        t_short = trending & (fast < slow) & (fast.shift(1) >= slow.shift(1))
+        _apply(t_long, t_short, p.trend_stop_mult, np.nan, p.trend_trail_mult, "TREND")
+        # mean-reversion leg (fade band extremes when oversold/overbought)
+        mr_long = ranging & (df["close"] < df["bb_lo"]) & (df["rsi"] < p.rsi_os)
+        mr_short = ranging & (df["close"] > df["bb_up"]) & (df["rsi"] > p.rsi_ob)
+        _apply(mr_long, mr_short, p.mr_stop_mult, p.mr_tp_rr, 0.0, "MR")
+    else:
+        strong = df["adx"] > p.adx_min
+        htf_up = (df["htf_close"] > df["htf_ema"]) if p.use_htf_filter else True
+        htf_dn = (df["htf_close"] < df["htf_ema"]) if p.use_htf_filter else True
+        if p.entry_mode == "breakout":
+            hi = df["high"].rolling(p.breakout_lookback).max().shift(1)
+            lo = df["low"].rolling(p.breakout_lookback).min().shift(1)
+            long_trig = (df["close"] > hi) & (fast > slow)
+            short_trig = (df["close"] < lo) & (fast < slow)
+        elif p.entry_mode == "pullback":
+            long_trig = (fast > slow) & (df["close"] > fast) & (df["close"].shift(1) <= fast.shift(1))
+            short_trig = (fast < slow) & (df["close"] < fast) & (df["close"].shift(1) >= fast.shift(1))
+        else:  # ema_cross
+            long_trig = (fast > slow) & (fast.shift(1) <= slow.shift(1))
+            short_trig = (fast < slow) & (fast.shift(1) >= slow.shift(1))
+        _apply(long_trig & strong & htf_up, short_trig & strong & htf_dn,
+               np.nan, np.nan, np.nan, p.entry_mode)
+
+    # Absolute SL/TP prices for the live Signal, per leg.
+    sm = np.where(df["stop_mult"].notna(), df["stop_mult"], p.atr_stop_mult)
+    trails = df["trail_mult"].fillna(0.0) > 0
+    rr_eff = np.where(df["tp_rr"].notna(), df["tp_rr"],
+                      np.where(trails, p.trend_tp_ceiling_r, p.rr))
+    stop_dist = sm * df["atr"].to_numpy()
+    is_buy = (df["side"] == "buy").to_numpy()
+    is_sell = (df["side"] == "sell").to_numpy()
+    entry = df["close"].to_numpy()
+    df["entry"] = entry
+    df["stop"] = np.where(is_buy, entry - stop_dist,
+                          np.where(is_sell, entry + stop_dist, entry))
+    df["tp"] = np.where(is_buy, entry + rr_eff * stop_dist,
+                        np.where(is_sell, entry - rr_eff * stop_dist, entry))
+    return df
+
+
+class TrendStrategy(BaseStrategy):
+    """Implements the Strategy Protocol / BaseStrategy for production execution."""
+
+    def __init__(self, symbol: str = "BTCUSD", params: TrendParams = TrendParams()):
         self.symbol = symbol
+        self.p = params
+        self._min_bars = max(params.ema_slow, params.adx_period) + 5
 
     def generate_signal(self, candles: List[Candle], htf_candles: List[Candle]) -> Optional[Signal]:
-        """Generate trend signal from 15m and 1h candle feeds."""
-        raise NotImplementedError("To be implemented in Phase B2")
+        if len(candles) < self._min_bars or len(htf_candles) < self.p.htf_ema + 1:
+            return None
+        df15 = _candles_to_df(candles)
+        df1h = _candles_to_df(htf_candles)
+        sig = compute_signals(df15, df1h, self.p)
+        last = sig.iloc[-1]
+        if not last["side"]:
+            return None
+        return Signal(
+            symbol=self.symbol,
+            side=last["side"],
+            entry_price=float(last["entry"]),
+            stop_loss=float(last["stop"]),
+            take_profit=float(last["tp"]),
+            reason=str(last["reason"]),
+            ts=int(candles[-1].ts),
+        )
+
+
+# Backward-compatible alias for existing tests and contracts
+TrendFollowingStrategy = TrendStrategy

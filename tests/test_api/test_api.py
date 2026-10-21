@@ -297,3 +297,132 @@ def test_end_to_end_pipeline_integration():
     assert status_resp.status_code == 200
     assert status_resp.json()["status"] == "running"
     assert status_resp.json()["open_positions_count"] >= 1
+
+
+def test_dashboard_and_candles_endpoints():
+    client = TestClient(app)
+
+    # 1. Test /dashboard
+    resp_dash = client.get("/dashboard")
+    assert resp_dash.status_code == 200
+    assert "Delta Quant Core" in resp_dash.text
+    assert "8-Rule Risk Radar" in resp_dash.text
+
+    # 2. Test /ui
+    resp_ui = client.get("/ui")
+    assert resp_ui.status_code == 200
+    assert "Delta Quant Core" in resp_ui.text
+
+    # 3. Test /candles
+    resp_candles = client.get("/api/candles?limit=10")
+    assert resp_candles.status_code == 200
+    assert isinstance(resp_candles.json(), list)
+
+
+def test_api_v1_endpoints_and_flatten():
+    client = TestClient(app)
+
+    # 1. Test /api/v1/status
+    res_status = client.get("/api/v1/status")
+    assert res_status.status_code == 200
+    assert res_status.json()["status"] == "running"
+
+    # 2. Test /api/v1/demo/trigger
+    res_demo = client.post("/api/v1/demo/trigger", json={"side": "buy"})
+    assert res_demo.status_code == 200
+    assert res_demo.json()["result"]["ok"] is True
+
+    # Position should now exist
+    pos_res = client.get("/api/v1/positions")
+    assert pos_res.status_code == 200
+    assert len(pos_res.json()) >= 1
+
+    # 3. Test 1-click /api/v1/positions/flatten
+    res_flatten = client.post("/api/v1/positions/flatten")
+    assert res_flatten.status_code == 200
+    assert res_flatten.json()["status"] == "flattened"
+
+    # Positions should be empty
+    pos_after = client.get("/api/v1/positions")
+    assert pos_after.status_code == 200
+    assert len(pos_after.json()) == 0
+    # Engine should not be halted by flatten
+    assert not risk_manager.is_halted()
+
+    # 4. Test /api/v1/pause and /api/v1/resume
+    res_pause = client.post("/api/v1/pause")
+    assert res_pause.status_code == 200
+    assert res_pause.json()["status"] == "paused"
+    assert risk_manager.is_halted()
+
+    res_resume = client.post("/api/v1/resume")
+    assert res_resume.status_code == 200
+    assert res_resume.json()["status"] == "resumed"
+    assert not risk_manager.is_halted()
+
+    # 5. Test /api/v1/kill
+    res_kill = client.post("/api/v1/kill", json={"reason": "v1 kill test"})
+    assert res_kill.status_code == 200
+    assert res_kill.json()["status"] == "killed"
+    assert risk_manager.is_halted()
+
+    # Reset
+    risk_manager.resume()
+
+
+def test_mode_and_backtest_endpoints():
+    client = TestClient(app)
+
+    # 1. Test GET /api/v1/mode
+    res_mode = client.get("/api/v1/mode")
+    assert res_mode.status_code == 200
+    assert "mode" in res_mode.json()
+
+    # 2. Test POST /api/v1/mode
+    res_set = client.post("/api/v1/mode", json={"mode": "uploaded"})
+    assert res_set.status_code == 200
+    assert res_set.json()["mode"] == "uploaded"
+
+    res_back = client.post("/api/v1/mode", json={"mode": "live"})
+    assert res_back.status_code == 200
+    assert res_back.json()["mode"] == "live"
+
+
+def test_candles_storage_upload_and_backtest():
+    client = TestClient(app)
+
+    # 1. Test GET /api/v1/candles/summary
+    res_summary = client.get("/api/v1/candles/summary")
+    assert res_summary.status_code == 200
+    assert isinstance(res_summary.json(), dict)
+
+    # 2. Test POST /api/v1/candles/upload with CSV data
+    csv_content = (
+        "ts,open,high,low,close,volume\n"
+        "1700000000,82000.0,82500.0,81900.0,82300.0,10.5\n"
+        "1700000900,82300.0,82800.0,82200.0,82700.0,15.2\n"
+        "1700001800,82700.0,83200.0,82600.0,83000.0,12.8\n"
+    )
+    files = {"file": ("test_btc_15m.csv", csv_content, "text/csv")}
+    res_upload = client.post("/api/v1/candles/upload?timeframe=15m", files=files)
+    assert res_upload.status_code == 200
+    upload_data = res_upload.json()
+    assert upload_data["status"] == "ok"
+    assert upload_data["count"] >= 3
+
+    # 3. Test GET /api/v1/candles with resolution
+    res_candles = client.get("/api/v1/candles?resolution=15m&limit=10")
+    assert res_candles.status_code == 200
+    candles = res_candles.json()
+    assert len(candles) >= 3
+
+    # 4. Test POST /api/v1/backtest/run
+    res_bt = client.post("/api/v1/backtest/run")
+    assert res_bt.status_code == 200
+    bt_data = res_bt.json()
+    assert bt_data["status"] == "ok"
+    assert "metrics" in bt_data
+    assert "total_return_pct" in bt_data["metrics"]
+    assert "trades" in bt_data
+
+

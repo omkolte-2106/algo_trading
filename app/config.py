@@ -25,9 +25,9 @@ class Settings(BaseSettings):
     DB_PATH: str = "trader.db"
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
-    DB_NAME: str = "algo_bot"
+    DB_NAME: str = "algo_bot2"
     DB_USER: str = "postgres"
-    DB_PASSWORD: str = ""
+    DB_PASSWORD: str = "2106"
 
     model_config = SettingsConfigDict(
         env_file=".env",
